@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
+import { io } from 'socket.io-client';
 import {
   Alert,
   Button,
@@ -63,15 +64,6 @@ function formatCoins(cents) {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(cents / COIN_CENTS);
 }
 
-async function requestJson(path, options) {
-  const response = await fetch(path, options);
-  const data = await response.json();
-  if (!response.ok) {
-    throw new Error(data.error || `Request failed with status ${response.status}.`);
-  }
-  return data;
-}
-
 function Dice({ value, rolling }) {
   const faceTransforms = {
     1: 'rotateX(0deg) rotateY(0deg)',
@@ -122,35 +114,73 @@ function App() {
   const [isRolling, setIsRolling] = useState(false);
   const [message, setMessage] = useState(null);
   const [history, setHistory] = useState([]);
+  const socketRef = useRef(null);
+  const [room, setRoom] = useState(null);
+  const [roomCode, setRoomCode] = useState('friends');
+  const [lobbyNotice, setLobbyNotice] = useState('');
+  const [isPending, setIsPending] = useState(false);
+  const [clock, setClock] = useState(Date.now);
+  const secondsLeft = room ? Math.max(0, Math.ceil((room.localEndsAt - clock) / 1000)) : 0;
 
   useEffect(() => {
-    let cancelled = false;
-
-    async function loadGame() {
-      try {
-        const snapshot = await requestJson('/api/balance');
-        if (cancelled) return;
-        setBalanceCents(snapshot.balanceCents);
-        setActiveBet(snapshot.activeBet);
-        setHistory(snapshot.history);
-        if (snapshot.activeBet) {
-          setBetType(snapshot.activeBet.betType);
-          setPrediction(snapshot.activeBet.prediction);
-          setBetAmount(String(snapshot.activeBet.betAmount));
-        }
-        if (snapshot.history.length) setDieValue(snapshot.history[0].outcome);
-      } catch (error) {
-        if (!cancelled) {
-          console.error('Unable to retrieve the game balance from the server.', error);
-          setMessage({ type: 'error', text: `Could not connect to the game server: ${error.message}` });
-        }
-      } finally {
-        if (!cancelled) setIsLoadingBalance(false);
+    const socket = io();
+    socketRef.current = socket;
+    let rollTimer;
+    const clockTimer = window.setInterval(() => setClock(Date.now()), 100);
+    socket.on('connect', () => {
+      setIsLoadingBalance(false);
+      setMessage({ type: 'info', text: 'Join a room to play. Share its code with up to three friends.' });
+    });
+    socket.on('connect_error', () => {
+      setMessage({ type: 'error', text: 'Could not connect to the game server. Retrying…' });
+    });
+    socket.on('disconnect', () => {
+      setIsLoadingBalance(true);
+      setRoom(null);
+      setActiveBet(null);
+      setBalanceCents(0);
+      setHistory([]);
+      setDieValue(null);
+      setIsRolling(false);
+      window.clearTimeout(rollTimer);
+      setLobbyNotice('');
+      setMessage({ type: 'error', text: 'Disconnected. Rejoin a room after reconnecting; connection-based credits reset.' });
+    });
+    socket.on('room_state', (state) => {
+      const localNow = Date.now();
+      setClock(localNow);
+      setRoom({ ...state, localEndsAt: localNow + state.endsAt - state.serverNow });
+    });
+    socket.on('player_joined', ({ playerId }) => {
+      setLobbyNotice(playerId === socket.id ? 'You joined the room.' : 'A player joined the room.');
+    });
+    socket.on('player_left', () => setLobbyNotice('A player left the room.'));
+    socket.on('dice_rolled', ({ outcome }) => {
+      window.clearTimeout(rollTimer);
+      setIsRolling(true);
+      setDieValue(outcome);
+      rollTimer = window.setTimeout(() => setIsRolling(false), ROLL_DURATION_MS);
+    });
+    socket.on('balance_update', (state) => {
+      setBalanceCents(state.balanceCents);
+      setActiveBet(state.activeBet);
+      setHistory(state.history);
+      if (typeof state.won === 'boolean') {
+        setMessage({
+          type: state.won ? 'success' : 'loss',
+          text: state.won
+            ? `You called it! ${formatCoins(state.payoutCents)} coins returned — ${formatCoins(state.netCents)} coins profit.`
+            : `The dice had other plans. ${formatCoins(-state.netCents)} coins lost.`,
+        });
       }
-    }
-
-    loadGame();
-    return () => { cancelled = true; };
+    });
+    return () => {
+      window.clearInterval(clockTimer);
+      window.clearTimeout(rollTimer);
+      socket.removeAllListeners();
+      socket.disconnect();
+      socketRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -179,51 +209,47 @@ function App() {
     setMessage(null);
   }
 
-  async function roll() {
-    if (isRolling || isLoadingBalance) return;
+  async function send(event, payload = {}) {
+    if (!socketRef.current?.connected) throw new Error('You are not connected to the game server.');
+    const result = await socketRef.current.timeout(5000).emitWithAck(event, payload);
+    if (!result.ok) throw new Error(result.error);
+    return result;
+  }
+
+  async function changeRoom() {
+    setIsPending(true);
+    try {
+      if (room) {
+        await send('leave_room');
+        setRoom(null);
+        setDieValue(null);
+        setLobbyNotice('You left the room.');
+      } else {
+        await send('join_room', { roomId: roomCode.trim() });
+      }
+      setMessage(null);
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message });
+    } finally {
+      setIsPending(false);
+    }
+  }
+
+  async function placeBet() {
+    if (isPending || isLoadingBalance || !room || activeBet || secondsLeft === 0) return;
     if (!isBetValid) {
       setMessage({ type: 'error', text: 'Choose a prediction and enter a whole-number bet within your balance.' });
       return;
     }
 
-    setIsRolling(true);
-    setDieValue(null);
+    setIsPending(true);
     setMessage(null);
     try {
-      if (!activeBet) {
-        const placedBet = await requestJson('/api/bet', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ betType, prediction, betAmount: betNumber }),
-        });
-        setActiveBet(placedBet.activeBet);
-      }
-
-      const result = await requestJson('/api/roll', { method: 'POST' });
-      await new Promise((resolve) => window.setTimeout(resolve, ROLL_DURATION_MS));
-      setDieValue(result.outcome);
-      setBalanceCents(result.balanceCents);
-      setActiveBet(result.activeBet);
-      setHistory(result.history);
-      setMessage({
-        type: result.won ? 'success' : 'loss',
-        text: result.won
-          ? `You called it! ${formatCoins(result.payoutCents)} coins returned — ${formatCoins(result.netCents)} coins profit.`
-          : `The dice had other plans. ${formatCoins(betNumber * COIN_CENTS)} coins lost.`,
-      });
+      await send('place_bet', { betType, prediction, betAmount: betNumber, roundId: room.roundId });
     } catch (error) {
-      console.error('The game bet or roll request failed.', error);
       setMessage({ type: 'error', text: error.message });
-      try {
-        const snapshot = await requestJson('/api/balance');
-        setBalanceCents(snapshot.balanceCents);
-        setActiveBet(snapshot.activeBet);
-        setHistory(snapshot.history);
-      } catch (refreshError) {
-        console.error('Unable to refresh the game state after a failed request.', refreshError);
-      }
     } finally {
-      setIsRolling(false);
+      setIsPending(false);
     }
   }
 
@@ -236,7 +262,7 @@ function App() {
             <span className="brand-mark"><CasinoRoundedIcon /></span>
             <span>ROLL<span className="brand-dot">.</span>THE DICE</span>
           </a>
-          <Chip className="solo-chip" label="SOLO TABLE" size="small" />
+          <Chip className="solo-chip" label={room ? `${room.players.length}/4 PLAYERS` : 'MULTIPLAYER'} size="small" />
           <IconButton
             className="theme-toggle"
             aria-label={`Switch to ${themeMode === 'dark' ? 'light' : 'dark'} theme`}
@@ -255,8 +281,31 @@ function App() {
               Make your call.<br /><span>Trust the roll.</span>
             </Typography>
             <Typography className="subhead">
-              Pick your odds, place a bet, and see where the dice land.
+              Place your bet in 10 seconds. One roll for the whole room.
             </Typography>
+            <Paper elevation={0} sx={{ p: 2, mb: 2 }}>
+              <Typography className="micro-label">YOUR ROOM</Typography>
+              <TextField
+                label="Room code"
+                value={room ? room.roomId : roomCode}
+                onChange={(event) => setRoomCode(event.target.value)}
+                disabled={Boolean(room) || isPending}
+                size="small"
+                margin="normal"
+                fullWidth
+                inputProps={{ maxLength: 32 }}
+                helperText="Share this code with friends. Up to 4 players."
+              />
+              <Button
+                variant="outlined"
+                onClick={changeRoom}
+                disabled={isLoadingBalance || isPending || Boolean(activeBet)}
+              >
+                {room ? 'Leave room' : 'Join room'}
+              </Button>
+              <Typography role="status" sx={{ mt: 1 }}>{lobbyNotice}</Typography>
+              {room && <Typography>{room.players.length}/4 players · Betting closes in {secondsLeft}s</Typography>}
+            </Paper>
             <Paper className="balance-card" elevation={0}>
               <div className="balance-icon"><CasinoRoundedIcon /></div>
               <div className="balance-copy">
@@ -280,7 +329,7 @@ function App() {
                 <Typography className="micro-label">THE NEXT ROLL</Typography>
                 <Typography className="card-title">What’s your prediction?</Typography>
               </div>
-              <Chip label="1–6" size="small" className="range-chip" />
+              <Chip label={room ? `${secondsLeft}s to roll` : '1–6'} size="small" className="range-chip" />
             </div>
 
             <div className={`dice-table ${isRolling ? 'table-rolling' : ''}`}>
@@ -367,8 +416,8 @@ function App() {
                 color="primary"
                 size="large"
                 fullWidth
-                onClick={roll}
-                disabled={isRolling || isLoadingBalance || (!activeBet && balanceCents < COIN_CENTS)}
+                onClick={placeBet}
+                disabled={isRolling || isLoadingBalance || isPending || !room || secondsLeft === 0 || Boolean(activeBet) || balanceCents < COIN_CENTS}
                 className="roll-button"
                 startIcon={<CasinoRoundedIcon />}
               >
@@ -377,10 +426,10 @@ function App() {
                   : isRolling
                     ? 'Rolling…'
                     : activeBet
-                      ? 'Roll your bet'
-                      : balanceCents < COIN_CENTS
-                        ? 'Out of coins'
-                        : 'Roll the dice'}
+                      ? 'Bet placed — waiting for the room'
+                      : !room
+                        ? 'Join a room to bet'
+                        : balanceCents < COIN_CENTS ? 'Out of coins' : 'Place bet'}
               </Button>
               <Typography className="fair-play-note">
                 Virtual coins only · No purchase, no cash value
@@ -427,7 +476,7 @@ function App() {
 
         <footer className="page-footer">
           <span>ROLL THE DICE <span className="footer-dot">✳</span> PLAY YOUR ODDS</span>
-          <span>Single player · Up to 4 players coming later</span>
+          <span>Up to 4 players · Shared rolls every 10 seconds</span>
         </footer>
       </main>
     </ThemeProvider>

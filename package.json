@@ -1,7 +1,7 @@
 {
   "name": "roll-the-dice",
   "version": "1.0.0",
-  "description": "A single-player dice game with virtual credits",
+  "description": "A multiplayer dice game with virtual credits",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -22,7 +22,9 @@
     "@mui/icons-material": "^7.3.2",
     "@mui/material": "^7.3.2",
     "react": "^19.1.1",
-    "react-dom": "^19.1.1"
+    "react-dom": "^19.1.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^5.0.2",
