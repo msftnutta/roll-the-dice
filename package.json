@@ -1,0 +1,31 @@
+{
+  "name": "roll-the-dice",
+  "version": "1.0.0",
+  "description": "A single-player dice game with virtual credits",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "start": "node index.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "nodejs",
+    "dice",
+    "game"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.0",
+    "@mui/icons-material": "^7.3.2",
+    "@mui/material": "^7.3.2",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^5.0.2",
+    "vite": "^7.1.5"
+  }
+}
