@@ -41,3 +41,8 @@ Only one active bet can be pending at a time. The game state resets when the Nod
 ```bash
 npm test
 ```
+
+## Project Agent Skills
+
+- [Dice Game Engine](./.github/skills/dice-game-engine/SKILL.md) — game rules, server-owned state, and API conventions.
+- [Dice Game UI](./.github/skills/dice-game-ui/SKILL.md) — React/MUI UI, theme, accessibility, and API integration.
