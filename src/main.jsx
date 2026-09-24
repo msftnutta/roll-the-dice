@@ -20,10 +20,9 @@ import DarkModeRoundedIcon from '@mui/icons-material/DarkModeRounded';
 import HistoryRoundedIcon from '@mui/icons-material/HistoryRounded';
 import LocalFireDepartmentRoundedIcon from '@mui/icons-material/LocalFireDepartmentRounded';
 import LightModeRoundedIcon from '@mui/icons-material/LightModeRounded';
-import { BET_TYPES, COIN_CENTS, INITIAL_BALANCE_CENTS, rollDie, settleBet } from './game.js';
+import { BET_TYPES, COIN_CENTS } from './game.js';
 import './styles.css';
 
-const STORAGE_KEY = 'roll-the-dice:balance-cents:v1';
 const THEME_STORAGE_KEY = 'roll-the-dice:theme:v1';
 const ROLL_DURATION_MS = 850;
 
@@ -60,33 +59,17 @@ function getSavedTheme() {
   }
 }
 
-const initialGameState = () => {
-  try {
-    const saved = window.localStorage.getItem(STORAGE_KEY);
-    if (saved === null) {
-      return { balanceCents: INITIAL_BALANCE_CENTS, storageWarning: '' };
-    }
-
-    const balanceCents = Number(saved);
-    if (!Number.isSafeInteger(balanceCents) || balanceCents < 0) {
-      return {
-        balanceCents: INITIAL_BALANCE_CENTS,
-        storageWarning: 'Saved credits were invalid, so a fresh 100-coin balance was started.',
-      };
-    }
-
-    return { balanceCents, storageWarning: '' };
-  } catch (error) {
-    console.error('Unable to read the saved dice-game balance.', error);
-    return {
-      balanceCents: INITIAL_BALANCE_CENTS,
-      storageWarning: 'Your browser could not load saved credits. Your balance may reset if you leave this page.',
-    };
-  }
-};
-
 function formatCoins(cents) {
   return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(cents / COIN_CENTS);
+}
+
+async function requestJson(path, options) {
+  const response = await fetch(path, options);
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || `Request failed with status ${response.status}.`);
+  }
+  return data;
 }
 
 function Dice({ value, rolling }) {
@@ -127,10 +110,10 @@ function pipFor(face, index) {
 }
 
 function App() {
-  const [gameState, setGameState] = useState(initialGameState);
+  const [balanceCents, setBalanceCents] = useState(0);
+  const [isLoadingBalance, setIsLoadingBalance] = useState(true);
+  const [activeBet, setActiveBet] = useState(null);
   const [themeMode, setThemeMode] = useState(getSavedTheme);
-  const [themeStorageWarning, setThemeStorageWarning] = useState('');
-  const { balanceCents, storageWarning } = gameState;
   const theme = createGameTheme(themeMode);
   const [betType, setBetType] = useState('exact');
   const [prediction, setPrediction] = useState(6);
@@ -141,25 +124,41 @@ function App() {
   const [history, setHistory] = useState([]);
 
   useEffect(() => {
-    try {
-      window.localStorage.setItem(STORAGE_KEY, String(balanceCents));
-    } catch (error) {
-      console.error('Unable to save the dice-game balance.', error);
-      setGameState((current) => ({
-        ...current,
-        storageWarning: 'Your credits could not be saved. They may reset if you leave this page.',
-      }));
+    let cancelled = false;
+
+    async function loadGame() {
+      try {
+        const snapshot = await requestJson('/api/balance');
+        if (cancelled) return;
+        setBalanceCents(snapshot.balanceCents);
+        setActiveBet(snapshot.activeBet);
+        setHistory(snapshot.history);
+        if (snapshot.activeBet) {
+          setBetType(snapshot.activeBet.betType);
+          setPrediction(snapshot.activeBet.prediction);
+          setBetAmount(String(snapshot.activeBet.betAmount));
+        }
+        if (snapshot.history.length) setDieValue(snapshot.history[0].outcome);
+      } catch (error) {
+        if (!cancelled) {
+          console.error('Unable to retrieve the game balance from the server.', error);
+          setMessage({ type: 'error', text: `Could not connect to the game server: ${error.message}` });
+        }
+      } finally {
+        if (!cancelled) setIsLoadingBalance(false);
+      }
     }
-  }, [balanceCents]);
+
+    loadGame();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, themeMode);
-      setThemeStorageWarning('');
     } catch (error) {
       console.error('Unable to save the dice-game theme.', error);
-      setThemeStorageWarning('Your theme preference could not be saved.');
     }
   }, [themeMode]);
 
@@ -174,54 +173,58 @@ function App() {
     : 0;
 
   function chooseBetType(_event, nextType) {
-    if (!nextType) return;
+    if (!nextType || activeBet) return;
     setBetType(nextType);
     setPrediction(BET_TYPES[nextType].values[0]);
     setMessage(null);
   }
 
-  function roll() {
-    if (isRolling) return;
+  async function roll() {
+    if (isRolling || isLoadingBalance) return;
     if (!isBetValid) {
       setMessage({ type: 'error', text: 'Choose a prediction and enter a whole-number bet within your balance.' });
-      return;
-    }
-
-    const outcome = rollDie();
-    let result;
-    try {
-      result = settleBet({ balanceCents, betAmount: betNumber, betType, prediction, outcome });
-    } catch (error) {
-      setMessage({ type: 'error', text: error.message });
       return;
     }
 
     setIsRolling(true);
     setDieValue(null);
     setMessage(null);
-    window.setTimeout(() => {
-      setDieValue(outcome);
-      setGameState((current) => ({ ...current, balanceCents: result.balanceCents }));
+    try {
+      if (!activeBet) {
+        const placedBet = await requestJson('/api/bet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ betType, prediction, betAmount: betNumber }),
+        });
+        setActiveBet(placedBet.activeBet);
+      }
+
+      const result = await requestJson('/api/roll', { method: 'POST' });
+      await new Promise((resolve) => window.setTimeout(resolve, ROLL_DURATION_MS));
+      setDieValue(result.outcome);
+      setBalanceCents(result.balanceCents);
+      setActiveBet(result.activeBet);
+      setHistory(result.history);
       setMessage({
         type: result.won ? 'success' : 'loss',
         text: result.won
           ? `You called it! ${formatCoins(result.payoutCents)} coins returned — ${formatCoins(result.netCents)} coins profit.`
           : `The dice had other plans. ${formatCoins(betNumber * COIN_CENTS)} coins lost.`,
       });
-      setHistory((current) => [
-        {
-          id: `${Date.now()}-${outcome}`,
-          outcome,
-          betAmount: betNumber,
-          betType,
-          prediction,
-          won: result.won,
-          payoutCents: result.payoutCents,
-        },
-        ...current,
-      ].slice(0, 5));
+    } catch (error) {
+      console.error('The game bet or roll request failed.', error);
+      setMessage({ type: 'error', text: error.message });
+      try {
+        const snapshot = await requestJson('/api/balance');
+        setBalanceCents(snapshot.balanceCents);
+        setActiveBet(snapshot.activeBet);
+        setHistory(snapshot.history);
+      } catch (refreshError) {
+        console.error('Unable to refresh the game state after a failed request.', refreshError);
+      }
+    } finally {
       setIsRolling(false);
-    }, ROLL_DURATION_MS);
+    }
   }
 
   return (
@@ -262,12 +265,6 @@ function App() {
               </div>
               <div className="balance-note"><LocalFireDepartmentRoundedIcon /> Every roll counts</div>
             </Paper>
-            {(storageWarning || themeStorageWarning) && (
-              <Alert severity="warning" className="storage-alert">
-                {[storageWarning, themeStorageWarning].filter(Boolean).join(' ')}
-              </Alert>
-            )}
-
             <div className="payout-note">
               <span className="payout-star">✳</span>
               <Typography>
@@ -303,7 +300,7 @@ function App() {
                 onChange={chooseBetType}
                 className="bet-type-group"
                 aria-label="Bet category"
-                disabled={isRolling}
+                disabled={isRolling || Boolean(activeBet)}
               >
                 <ToggleButton value="exact">Exact number <span>5×</span></ToggleButton>
                 <ToggleButton value="highLow">High / low <span>1.8×</span></ToggleButton>
@@ -322,7 +319,7 @@ function App() {
                 }}
                 className={`prediction-group ${betType === 'exact' ? 'number-predictions' : ''}`}
                 aria-label={selectedBet.label}
-                disabled={isRolling}
+                disabled={isRolling || Boolean(activeBet)}
               >
                 {selectedBet.values.map((value) => (
                   <ToggleButton value={value} key={value}>
@@ -346,7 +343,7 @@ function App() {
                       setMessage(null);
                     }}
                     inputProps={{ min: 1, max: Math.floor(balanceCents / COIN_CENTS), step: 1, inputMode: 'numeric', 'aria-label': 'Bet amount in coins' }}
-                    disabled={isRolling}
+                    disabled={isRolling || Boolean(activeBet)}
                     size="small"
                     className="bet-input"
                     error={betAmount !== '' && !isBetValid}
@@ -371,11 +368,19 @@ function App() {
                 size="large"
                 fullWidth
                 onClick={roll}
-                disabled={isRolling || balanceCents < COIN_CENTS}
+                disabled={isRolling || isLoadingBalance || (!activeBet && balanceCents < COIN_CENTS)}
                 className="roll-button"
                 startIcon={<CasinoRoundedIcon />}
               >
-                {isRolling ? 'Rolling…' : balanceCents < COIN_CENTS ? 'Out of coins' : 'Roll the dice'}
+                {isLoadingBalance
+                  ? 'Connecting…'
+                  : isRolling
+                    ? 'Rolling…'
+                    : activeBet
+                      ? 'Roll your bet'
+                      : balanceCents < COIN_CENTS
+                        ? 'Out of coins'
+                        : 'Roll the dice'}
               </Button>
               <Typography className="fair-play-note">
                 Virtual coins only · No purchase, no cash value

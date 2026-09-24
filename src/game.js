@@ -28,7 +28,7 @@ export function rollDie(random = Math.random) {
   return Math.floor(sample * 6) + 1;
 }
 
-export function settleBet({ balanceCents, betAmount, betType, prediction, outcome }) {
+export function validateBet({ balanceCents, betAmount, betType, prediction }) {
   if (!Number.isSafeInteger(balanceCents) || balanceCents < 0) {
     throw new RangeError('Balance must be a non-negative amount in cents.');
   }
@@ -46,6 +46,11 @@ export function settleBet({ balanceCents, betAmount, betType, prediction, outcom
     throw new RangeError('Choose a valid prediction before rolling.');
   }
 
+  return betCents;
+}
+
+export function settleBet({ balanceCents, betAmount, betType, prediction, outcome }) {
+  const betCents = validateBet({ balanceCents, betAmount, betType, prediction });
   if (!Number.isInteger(outcome) || outcome < 1 || outcome > 6) {
     throw new RangeError('The dice outcome must be a number from 1 to 6.');
   }
