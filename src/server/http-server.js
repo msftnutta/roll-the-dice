@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs';
 import { extname, isAbsolute, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GameEngine, GameError } from './game-engine.js';
+import { attachRoomServer } from './socket-server.js';
 
 const distDirectory = fileURLToPath(new URL('../../dist/', import.meta.url));
 const indexPath = resolve(distDirectory, 'index.html');
@@ -176,12 +177,12 @@ async function handleStatic(request, response, pathname) {
   response.end(request.method === 'HEAD' ? undefined : contents);
 }
 
-export function createGameServer({ game = new GameEngine(), serveStatic = true } = {}) {
+export function createGameServer({ game = new GameEngine(), serveStatic = true, roomOptions } = {}) {
   if (serveStatic && !existsSync(indexPath)) {
     throw new Error('The production build was not found. Run "npm run build" before starting the server.');
   }
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     try {
       const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
       if (pathname.startsWith('/api/')) {
@@ -206,4 +207,6 @@ export function createGameServer({ game = new GameEngine(), serveStatic = true }
       }
     }
   });
+  attachRoomServer(server, roomOptions);
+  return server;
 }
